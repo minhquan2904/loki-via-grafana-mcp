@@ -123,26 +123,26 @@ to datasources of type `loki` that the service account can see.
 | Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors | Notes |
 |---|---|---|---|---|---|
 | S0 | 2.558 / 3.12 | 4.267 / 6.467 | 0 | 0 | fake Grafana — server overhead only |
-| S1 | 42.196 / 51.691 | 41.361 / 44.81 | 0 | 0 | real Grafana Cloud Loki |
-| S2 | 35.947 / 46.56 | 36.839 / 40.172 | 0 | 0 | real Grafana Cloud Loki |
-| S3 | 32.107 / 42.83 | 51.055 / 70.658 | 0 | 0 | real Grafana Cloud Loki |
+| S1 | 42.196 / 51.691 | 41.361 / 44.81 | 0 | 0 | self-hosted Grafana + Loki |
+| S2 | 35.947 / 46.56 | 36.839 / 40.172 | 0 | 0 | self-hosted Grafana + Loki |
+| S3 | 32.107 / 42.83 | 51.055 / 70.658 | 0 | 0 | self-hosted Grafana + Loki |
 
 | Metric | Go | Python |
 |---|---|---|
-| Image size (MB) | 4.1 | 59.5 |
+| Image size, compressed (MB) | 4.1 | 59.5 |
 | Cold start to /healthz (ms) | 236 | 1017 |
 | RSS idle (MB) | 8.1 | 49.5 |
-| RSS peak under S4 (MB) | — | — |
+| RSS peak under S4 (MB) | not measured | not measured |
 | S3 points per series | 301 | 3601 |
 | S3 response size (KB) | 9.5 | 239.7 |
 
-Measured on 4 vCPU Intel(R) Core(TM) Ultra 7 265KF, 8 GB RAM, against a Loki datasource on Grafana Cloud, commit 009961a, 2026-10-14T07:11:11Z. Python = the FastMCP reference implementation this project replaces. Full report: docs/benchmarks.md
+Measured on 4 vCPU Intel(R) Core(TM) Ultra 7 265KF, 8 GB RAM, against a self-hosted Grafana + Loki stack (S1-S3; S4 not run), commit 009961a, 2026-10-14T07:11:11Z. Python = the FastMCP reference implementation this project replaces. Full report: docs/benchmarks.md
 <!-- BENCH:END -->
 
 The numbers are produced by `cmd/bench`, which drives both this server and the
 FastMCP reference implementation through their MCP interfaces, so the figures
 include MCP overhead. `scripts/bench.sh` runs S0 (against a fake Grafana, to
-isolate server cost) and S1-S4 (against Grafana Cloud). Raw output is gitignored
+isolate server cost) and S1-S4 (against a real Grafana). These figures are a preliminary run: S4 and a run against Grafana Cloud are still to come. Raw output is gitignored
 and never published: `cmd/benchreport` refuses to render a value that matches a
 deny pattern or carries an address, and `scripts/denylist-scan.sh` scans both the
 working tree and the whole history before a release.
