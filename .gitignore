@@ -1,0 +1,13 @@
+# Local environment and secrets. Never commit these.
+.env
+.secrets/
+.denylist.local
+private/
+
+# Benchmark output (raw rows contain internal identifiers).
+bench-out/
+
+# Build artifacts.
+/server
+dist/
+*.out

@@ -1,0 +1,16 @@
+{
+  "schema": {
+    "fields": [
+      { "name": "Time", "type": "time" },
+      { "name": "Value #A", "type": "number", "labels": { "app": "demo", "env": "test" } },
+      { "name": "Value #B", "type": "number" }
+    ]
+  },
+  "data": {
+    "values": [
+      [1759800000000, 1759800001000],
+      [3, null],
+      [null, 7]
+    ]
+  }
+}

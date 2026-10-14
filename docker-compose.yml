@@ -1,0 +1,35 @@
+services:
+  loki-via-grafana-mcp:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: loki-via-grafana-mcp:${VERSION:-dev}
+    # Published on the loopback interface only: the server is meant to sit
+    # behind a gateway that terminates the public TLS connection.
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_LISTEN: 0.0.0.0:8000
+      MCP_ALLOWED_HOSTS: localhost:*,127.0.0.1:*,loki-via-grafana-mcp:8000
+      GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE: /run/secrets/grafana_sa_token
+      MCP_TOKEN_FILE: /run/secrets/mcp_token
+    secrets:
+      - grafana_sa_token
+      - mcp_token
+    # The image is static and read-only: nothing is written inside the container.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+secrets:
+  grafana_sa_token:
+    file: ./.secrets/grafana_sa_token
+  mcp_token:
+    file: ./.secrets/mcp_token

@@ -1,0 +1,16 @@
+{
+  "schema": {
+    "fields": [
+      { "name": "labels", "type": "other" },
+      { "name": "timestamp", "type": "time" },
+      { "name": "body", "type": "string" }
+    ]
+  },
+  "data": {
+    "values": [
+      [{ "app": "demo", "env": "test" }, { "app": "demo", "env": "test" }],
+      [1759800000000, 1759800001000],
+      ["level=error msg=\"boom\"", "level=info msg=\"second\""]
+    ]
+  }
+}

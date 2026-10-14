@@ -1,0 +1,17 @@
+{
+  "from": "1791374400000",
+  "to": "1791375300000",
+  "queries": [
+    {
+      "refId": "A",
+      "datasource": { "type": "loki", "uid": "loki-demo" },
+      "expr": "{app=\"demo\"} |= \"error\"",
+      "queryType": "range",
+      "maxLines": 100,
+      "direction": "backward",
+      "step": "3s",
+      "intervalMs": 3000,
+      "maxDataPoints": 300
+    }
+  ]
+}
