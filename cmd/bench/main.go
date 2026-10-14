@@ -80,12 +80,15 @@ func main() {
 }
 
 func run(args []string, environ []string) error {
+	// The fake Grafana is a standalone test double: serving it needs none of the
+	// benchmark options, so it is started before they are validated.
+	if addr, ok := fakeGrafanaFlag(args); ok {
+		return serveFakeGrafana(addr)
+	}
+
 	opts, err := parseOptions(args, environ)
 	if err != nil {
 		return err
-	}
-	if opts.fakeGrafana != "" {
-		return serveFakeGrafana(opts.fakeGrafana)
 	}
 
 	token, err := readToken(opts.tokenFile)
@@ -108,6 +111,24 @@ func run(args []string, environ []string) error {
 		rows = append(rows, measured...)
 	}
 	return writeRows(opts.out, rows)
+}
+
+// fakeGrafanaFlag reports the --fake-grafana value without validating the rest of
+// the command line, which is what lets the fake run on its own.
+func fakeGrafanaFlag(args []string) (string, bool) {
+	for i, arg := range args {
+		if value, ok := strings.CutPrefix(arg, "--fake-grafana="); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed, true
+			}
+		}
+		if arg == "--fake-grafana" && i+1 < len(args) {
+			if trimmed := strings.TrimSpace(args[i+1]); trimmed != "" {
+				return trimmed, true
+			}
+		}
+	}
+	return "", false
 }
 
 func parseOptions(args, environ []string) (options, error) {

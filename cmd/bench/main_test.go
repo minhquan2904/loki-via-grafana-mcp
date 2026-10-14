@@ -267,3 +267,27 @@ func TestParseOptions(t *testing.T) {
 		})
 	}
 }
+
+// TestFakeGrafanaFlag covers the regression that made S0 impossible: serving the
+// fake Grafana must not require --out, --token-file or any BENCH_* variable, so
+// the flag is read before the benchmark options are validated.
+func TestFakeGrafanaFlag(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+		ok   bool
+	}{
+		{[]string{"--fake-grafana", "0.0.0.0:9999"}, "0.0.0.0:9999", true},
+		{[]string{"--fake-grafana=0.0.0.0:9999"}, "0.0.0.0:9999", true},
+		{[]string{"--scenarios", "S0", "--fake-grafana", " 0.0.0.0:9999 "}, "0.0.0.0:9999", true},
+		{[]string{"--fake-grafana", ""}, "", false},
+		{[]string{"--out", "rows.jsonl"}, "", false},
+		{nil, "", false},
+	}
+	for _, tc := range cases {
+		addr, ok := fakeGrafanaFlag(tc.args)
+		if ok != tc.ok || addr != tc.want {
+			t.Fatalf("fakeGrafanaFlag(%v) = %q, %v; want %q, %v", tc.args, addr, ok, tc.want, tc.ok)
+		}
+	}
+}

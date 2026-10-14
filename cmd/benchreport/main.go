@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -341,6 +342,10 @@ func rss(values map[string]map[string]float64, target, kind string) string {
 	if !ok {
 		return "—"
 	}
+	// S4 is opt-in, so a peak of zero means "not measured" rather than "zero".
+	if value == 0 {
+		return "—"
+	}
 	return trimFloat(value)
 }
 
@@ -357,7 +362,8 @@ func responseKB(rows []row, target string) string {
 	if !ok {
 		return "—"
 	}
-	return trimFloat(entry.RespBytesP50 / 1024)
+	// One decimal is enough at this magnitude; the raw rows keep the exact value.
+	return strconv.FormatFloat(math.Round(entry.RespBytesP50/1024*10)/10, 'f', 1, 64)
 }
 
 func trimFloat(value float64) string {

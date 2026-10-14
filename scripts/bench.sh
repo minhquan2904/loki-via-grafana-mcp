@@ -110,7 +110,12 @@ command -v docker >/dev/null || { echo "bench: docker is required" >&2; exit 2; 
 FAKE_NAME="${FAKE_NAME:-fake-grafana}"
 FAKE_PORT="${FAKE_PORT:-9999}"
 FAKE_URL="http://${FAKE_NAME}:${FAKE_PORT}"
+# The published ports must match the GO_URL / PY_URL the caller passes in.
+GO_PORT="${GO_PORT:-18101}"
+PY_PORT="${PY_PORT:-18102}"
 OUT_DIR="${OUT_DIR:-bench-out/$(date -u +%Y%m%dT%H%M%SZ)}"
+# The bench containers are not the hardened deployment: they run as the calling
+# user so the 0600 secret files stay readable, and they need no healthcheck.
 mkdir -p "$OUT_DIR"
 echo "== bench: output in $OUT_DIR"
 
@@ -122,10 +127,11 @@ go run ./cmd/bench --fake-grafana "0.0.0.0:${FAKE_PORT}" >"$OUT_DIR/fake-grafana
 FAKE_PID=$!
 trap 'kill "$FAKE_PID" >/dev/null 2>&1 || true' EXIT
 
-start_container() {
-  local container="$1" grafana_url="$2" insecure="$3"
+start_container() { # container, grafana url, insecure flag, published port
+  local container="$1" grafana_url="$2" insecure="$3" port="$4"
   docker rm -f "$container" >/dev/null 2>&1 || true
   docker run -d --name "$container" \
+    --user "$(id -u):$(id -g)" \
     -e MCP_TRANSPORT=http -e MCP_LISTEN=0.0.0.0:8000 \
     -e GRAFANA_URL="$grafana_url" \
     -e GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE=/run/secrets/grafana_sa_token \
@@ -134,11 +140,11 @@ start_container() {
     -v "$(pwd)/.secrets/mcp_token:/run/secrets/mcp_token:ro" \
     ${insecure:+-e GRAFANA_ALLOW_INSECURE=true} \
     --add-host "${FAKE_NAME}:host-gateway" \
-    -p 127.0.0.1::8000 >/dev/null
+    -p "127.0.0.1:${port}:8000" >/dev/null
 }
 
-start_container "$GO_CONTAINER" "$FAKE_URL" "insecure"
-start_container "$PY_CONTAINER" "$FAKE_URL" "insecure"
+start_container "$GO_CONTAINER" "$FAKE_URL" "insecure" "$GO_PORT"
+start_container "$PY_CONTAINER" "$FAKE_URL" "insecure" "$PY_PORT"
 
 go run ./cmd/bench \
   --target "go=$GO_URL" --target "python=$PY_URL" \
@@ -152,8 +158,8 @@ go run ./cmd/bench \
 echo "== phase B: S1-S4 against the real Grafana Cloud stack"
 : "${GRAFANA_URL:?GRAFANA_URL is required for phase B}"
 
-start_container "$GO_CONTAINER" "$GRAFANA_URL" ""
-start_container "$PY_CONTAINER" "$GRAFANA_URL" ""
+start_container "$GO_CONTAINER" "$GRAFANA_URL" "" "$GO_PORT"
+start_container "$PY_CONTAINER" "$GRAFANA_URL" "" "$PY_PORT"
 
 GO_RSS="$OUT_DIR/rss-go.txt"
 PY_RSS="$OUT_DIR/rss-python.txt"
