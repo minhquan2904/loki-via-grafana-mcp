@@ -10,7 +10,7 @@ func Register(s *mcp.Server, d Deps) {
 	if ttl <= 0 {
 		ttl = defaultDSCacheTTL
 	}
-	d.ds = &dsCache{ttl: ttl}
+	d.ds = &dsCache{ttl: ttl, now: d.now}
 	addQueryLogs(s, d)
 	addListDatasources(s, d)
 }

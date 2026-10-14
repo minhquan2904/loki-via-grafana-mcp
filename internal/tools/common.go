@@ -44,8 +44,8 @@ type Deps struct {
 	Now        func() time.Time // nil -> time.Now
 	DSCacheTTL time.Duration    // 0 -> 5m
 
-	// ds is installed by Register so both tools share one cache; a Deps built
-	// by hand (tests) gets a private one on first use.
+	// ds is installed by Register so both tools share one cache. A Deps built
+	// by hand without Register gets a fresh, empty cache on every call.
 	ds *dsCache
 }
 
@@ -63,10 +63,11 @@ func (d Deps) now() time.Time {
 	return d.Now()
 }
 
-// datasourceCache returns the shared cache, creating one for hand-built Deps.
+// datasourceCache returns the shared cache, or a fresh one for a Deps that did
+// not go through Register.
 func (d Deps) datasourceCache() *dsCache {
 	if d.ds == nil {
-		d.ds = &dsCache{ttl: defaultDSCacheTTL}
+		return &dsCache{ttl: defaultDSCacheTTL, now: d.now}
 	}
 	return d.ds
 }
@@ -85,27 +86,51 @@ func readOnly() *mcp.ToolAnnotations {
 
 // dsCache memoizes the Loki datasource list so a burst of queries does not turn
 // into a burst of /api/datasources calls. Failures are never cached, so a
-// transient error does not lock the server out.
+// transient error does not lock the server out. The lock is never held across
+// the network call: one caller fetches while the others wait on inflight and
+// can still give up when their own context ends.
 type dsCache struct {
-	mu     sync.Mutex
-	ttl    time.Duration
-	loaded bool
-	at     time.Time
-	list   []grafana.Datasource
+	mu       sync.Mutex
+	ttl      time.Duration
+	now      func() time.Time
+	loaded   bool
+	at       time.Time
+	list     []grafana.Datasource
+	inflight chan struct{} // non-nil while a fetch runs; closed when it ends
 }
 
 func (c *dsCache) datasources(ctx context.Context, g Grafana) ([]grafana.Datasource, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.loaded && time.Since(c.at) < c.ttl {
-		return c.list, nil
+	for {
+		c.mu.Lock()
+		if c.loaded && c.now().Sub(c.at) < c.ttl {
+			list := c.list
+			c.mu.Unlock()
+			return list, nil
+		}
+		if wait := c.inflight; wait != nil {
+			c.mu.Unlock()
+			select {
+			case <-wait:
+				continue // the fetch ended; use its result or try again
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		done := make(chan struct{})
+		c.inflight = done
+		c.mu.Unlock()
+
+		list, err := g.ListDatasources(ctx)
+
+		c.mu.Lock()
+		if err == nil {
+			c.list, c.at, c.loaded = list, c.now(), true
+		}
+		c.inflight = nil
+		close(done)
+		c.mu.Unlock()
+		return list, err
 	}
-	list, err := g.ListDatasources(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c.list, c.at, c.loaded = list, time.Now(), true
-	return list, nil
 }
 
 // requireLoki refuses a uid outside the Loki datasource list. /api/ds/query
@@ -158,10 +183,10 @@ func instrument[In any, Out any](d Deps, tool string, h func(ctx context.Context
 			if err != nil {
 				attrs = append(attrs, "error", truncateRunes(err.Error(), maxToolErrorRunes))
 			}
-			d.logger().Info("tool call", attrs...)
-			if info.logql != "" {
-				d.logger().Debug("tool call", "tool", tool, "logql", info.logql)
+			if info.logql != "" && d.logger().Enabled(ctx, slog.LevelDebug) {
+				attrs = append(attrs, "logql", info.logql)
 			}
+			d.logger().Info("tool call", attrs...)
 		}()
 
 		var herr error

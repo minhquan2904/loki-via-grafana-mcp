@@ -59,13 +59,16 @@ func handleQueryLogs(d Deps) func(ctx context.Context, in QueryLogsIn) (QueryLog
 		if uid == "" || logql == "" {
 			return empty, callInfo{}, fmt.Errorf("datasource_uid and logql are required")
 		}
+		// info carries the query into the call log (debug level) on every path,
+		// failed ones included.
+		info := callInfo{logql: logql}
 
 		direction := in.Direction
 		if direction == "" {
 			direction = "backward"
 		}
 		if direction != "backward" && direction != "forward" {
-			return empty, callInfo{}, fmt.Errorf(`direction must be "backward" or "forward"`)
+			return empty, info, fmt.Errorf(`direction must be "backward" or "forward"`)
 		}
 
 		limit := clampLimit(in.Limit)
@@ -73,32 +76,32 @@ func handleQueryLogs(d Deps) func(ctx context.Context, in QueryLogsIn) (QueryLog
 		now := d.now()
 		from, err := grafana.ResolveTime(orDefault(in.Start, "now-1h"), now)
 		if err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 		to, err := grafana.ResolveTime(orDefault(in.End, "now"), now)
 		if err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 		if !from.Before(to) {
-			return empty, callInfo{}, fmt.Errorf("start must be before end")
+			return empty, info, fmt.Errorf("start must be before end")
 		}
 		if to.Sub(from) > maxWindow {
-			return empty, callInfo{}, fmt.Errorf("time window must not exceed 31 days")
+			return empty, info, fmt.Errorf("time window must not exceed 31 days")
 		}
 
-		step, err := grafana.ParseStep(in.Step)
+		step, err := grafana.ParseStep(strings.TrimSpace(in.Step))
 		if err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 		if step == 0 {
 			step = grafana.AutoStep(from, to)
 		}
 		if points := int(math.Ceil(float64(to.Sub(from)) / float64(step))); points > maxPoints {
-			return empty, callInfo{}, fmt.Errorf("step too small for this window: at most %d points per series", maxPoints)
+			return empty, info, fmt.Errorf("step too small for this window: at most %d points per series", maxPoints)
 		}
 
 		if err := d.requireLoki(ctx, uid); err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 
 		payload := grafana.BuildPayload(grafana.QueryParams{
@@ -112,15 +115,15 @@ func handleQueryLogs(d Deps) func(ctx context.Context, in QueryLogsIn) (QueryLog
 		})
 		frames, err := d.Grafana.DSQuery(ctx, payload)
 		if err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 		result, err := grafana.ParseFrames(frames)
 		if err != nil {
-			return empty, callInfo{}, err
+			return empty, info, err
 		}
 		result.Finish(direction, limit)
 
-		info := callInfo{resultType: result.Type, count: len(result.Logs), logql: logql}
+		info.resultType, info.count = result.Type, len(result.Logs)
 		if result.Type == "series" {
 			info.count = len(result.Series)
 		}
