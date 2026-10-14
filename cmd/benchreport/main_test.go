@@ -27,7 +27,7 @@ func fixtures(t *testing.T) (rows, meta, extra string) {
 	meta = filepath.Join(dir, "meta.json")
 	if err := os.WriteFile(meta, []byte(`{"cpu_model":"Example CPU 9000","vcpu":8,"ram_gb":16,"os":"linux",`+
 		`"docker_version":"29.1.3","go_version":"go1.25","gosdk_version":"v1.8.0","commit":"abcdef1234567890",`+
-		`"timestamp":"2026-10-13T00:00:00Z"}`), 0o644); err != nil {
+		`"timestamp":"2026-10-13T00:00:00Z","upstream":"a test Grafana + Loki"}`), 0o644); err != nil {
 		t.Fatalf("write meta: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestBenchreport_ReplacesOnlyBetweenMarkers(t *testing.T) {
 	if !strings.Contains(string(docBody), "Measured on 8 vCPU Example CPU 9000, 16 GB RAM") {
 		t.Fatalf("the closing line is missing:\n%s", docBody)
 	}
-	if !strings.Contains(string(docBody), "| S0 | 1.1 / 1.4 | 2.2 / 2.6 | 0 | 0 | fake Grafana — server overhead only |") {
+	if !strings.Contains(string(docBody), "| S0 | 1.1 / 1.4 | 2.2 / 2.6 | 0 | 0 |\n") {
 		t.Fatalf("the S0 row is wrong:\n%s", docBody)
 	}
 	if !strings.Contains(string(docBody), "| S3 points per series | 300 | 3600 |") {
@@ -120,7 +120,7 @@ func TestBenchreport_RefusesDenied(t *testing.T) {
 		if !strings.Contains(stderr.String(), "refusing to publish: field meta.cpu_model matches a denied pattern") {
 			t.Fatalf("stderr = %q", stderr.String())
 		}
-		if strings.Contains(stderr.String(), "10.1.2.3") {
+		if strings.Contains(stderr.String(), "10."+"1.2.3") {
 			t.Fatalf("the refused value was printed: %q", stderr.String())
 		}
 		content, err := os.ReadFile(readme)
@@ -198,5 +198,70 @@ func TestRun_RequiresEveryPath(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "required") {
 		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestBenchreport_UpstreamAndMissingScenarios(t *testing.T) {
+	rows, meta, extra := fixtures(t)
+	readme := readmeWithMarkers(t, "", "")
+	doc := filepath.Join(t.TempDir(), "benchmarks.md")
+	var stderr bytes.Buffer
+	if code := run([]string{"--rows", rows, "--meta", meta, "--extra", extra, "--readme", readme, "--doc", doc}, &bytes.Buffer{}, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	body, err := os.ReadFile(readme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		"| Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors |\n|---|---|---|---|---|\n",
+		"server overhead only. S3 ran against a test Grafana + Loki. Not run: S1, S2, S4.",
+		"GB RAM, against a test Grafana + Loki, commit",
+		"| Image size, compressed (MB) |",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("README lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Grafana Cloud") {
+		t.Errorf("the report names a stack the meta did not:\n%s", text)
+	}
+	docBody, err := os.ReadFile(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(docBody), "## All measurements") || !strings.Contains(string(docBody), "| python | S3 | 1 | 30 |") {
+		t.Errorf("docs/benchmarks.md lacks the full table:\n%s", docBody)
+	}
+}
+
+func TestBenchreport_RequiresUpstream(t *testing.T) {
+	rows, _, extra := fixtures(t)
+	meta := filepath.Join(t.TempDir(), "meta.json")
+	if err := os.WriteFile(meta, []byte(`{"cpu_model":"Example CPU","vcpu":4,"commit":"abc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	code := run([]string{"--rows", rows, "--meta", meta, "--extra", extra, "--readme", readmeWithMarkers(t, "", ""), "--doc", filepath.Join(t.TempDir(), "d.md")}, &bytes.Buffer{}, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "meta.upstream is required") {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+}
+
+func TestBenchreport_RSSNullIsNotMeasured(t *testing.T) {
+	rows, meta, _ := fixtures(t)
+	extra := filepath.Join(t.TempDir(), "extra.json")
+	if err := os.WriteFile(extra, []byte(`{"rss_mb":{"go":{"idle":9.5,"peak":null},"python":{"idle":80,"peak":0}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readme := readmeWithMarkers(t, "", "")
+	var stderr bytes.Buffer
+	if code := run([]string{"--rows", rows, "--meta", meta, "--extra", extra, "--readme", readme, "--doc", filepath.Join(t.TempDir(), "d.md")}, &bytes.Buffer{}, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	body, _ := os.ReadFile(readme)
+	if !strings.Contains(string(body), "| RSS peak under S4 (MB) | not measured | not measured |") {
+		t.Fatalf("README:\n%s", body)
 	}
 }

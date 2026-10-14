@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/minhquan2904/loki-via-grafana-mcp/internal/redact"
 )
@@ -48,7 +49,7 @@ func TestBuildRow(t *testing.T) {
 		{latencyMS: 10, respBytes: 100, lines: 5},
 		{latencyMS: 20, respBytes: 200, lines: 6},
 		{latencyMS: 30, respBytes: 300, lines: 7, failed: true, throttled: true},
-	})
+	}, 0)
 
 	if got.Target != "go" || got.Scenario != "S1" || got.Concurrency != 1 {
 		t.Fatalf("identity fields = %+v", got)
@@ -289,5 +290,75 @@ func TestFakeGrafanaFlag(t *testing.T) {
 		if ok != tc.ok || addr != tc.want {
 			t.Fatalf("fakeGrafanaFlag(%v) = %q, %v; want %q, %v", tc.args, addr, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+func TestErrorGuard_TripsAsSoonAsTheRateIsExceeded(t *testing.T) {
+	guard := &errorGuard{target: "go", scenario: "S4", max: 0.05}
+	// Below minGuardCalls nothing trips, even with every call failing.
+	for i := range minGuardCalls - 1 {
+		if err := guard.record(sample{failed: true}); err != nil {
+			t.Fatalf("tripped after %d calls", i+1)
+		}
+	}
+	if err := guard.record(sample{failed: true}); err == nil {
+		t.Fatalf("the guard did not trip at %d failed calls", minGuardCalls)
+	}
+
+	healthy := &errorGuard{target: "go", scenario: "S1", max: 0.05}
+	for range 100 {
+		if err := healthy.record(sample{}); err != nil {
+			t.Fatalf("a clean run tripped: %v", err)
+		}
+	}
+	if err := healthy.record(sample{failed: true}); err != nil {
+		t.Fatalf("1 failure in 101 calls tripped a 5%% limit: %v", err)
+	}
+}
+
+func TestIsThrottled(t *testing.T) {
+	for text, want := range map[string]bool{
+		"calling tools/call: 429 Too Many Requests": true,
+		"Grafana /api/ds/query 429: slow down":      true,
+		"Too Many Requests":                         true,
+		"Grafana /api/ds/query 500: boom":           false,
+	} {
+		if got := isThrottled(text); got != want {
+			t.Errorf("isThrottled(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+func TestBuildRow_ConcurrentRPSUsesWallClock(t *testing.T) {
+	samples := make([]sample, 10)
+	for i := range samples {
+		samples[i] = sample{latencyMS: 100}
+	}
+	// 10 calls of 100ms that overlapped within 200ms of wall time: 50 rps, not 10.
+	if got := buildRow("go", "S4", 10, samples, 200*time.Millisecond).RPS; got != 50 {
+		t.Fatalf("RPS = %v, want 50", got)
+	}
+	if got := buildRow("go", "S1", 1, samples, 0).RPS; got != 10 {
+		t.Fatalf("sequential RPS = %v, want 10", got)
+	}
+}
+
+func TestAppendRows_KeepsEarlierScenarios(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rows.jsonl")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendRows(path, []Row{{Target: "go", Scenario: "S1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendRows(path, []Row{{Target: "go", Scenario: "S2"}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(string(raw), "\n"); lines != 2 || !strings.Contains(string(raw), `"S1"`) {
+		t.Fatalf("rows file = %q", raw)
 	}
 }

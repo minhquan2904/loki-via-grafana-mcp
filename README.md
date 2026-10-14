@@ -45,7 +45,7 @@ writes to Grafana.
 
 | Env | Required | Default | Notes |
 |---|---|---|---|
-| `GRAFANA_URL` | yes | — | Absolute `http(s)` URL, no trailing slash |
+| `GRAFANA_URL` | yes | — | Absolute `http(s)` URL, no trailing slash, no `user:password@` |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE` | one of the two | — | Preferred; a file with exactly one non-empty line |
 | `GRAFANA_SERVICE_ACCOUNT_TOKEN` | one of the two | — | Never logged, never echoed in errors |
 | `MCP_TRANSPORT` | no | `stdio` | `stdio` or `http` |
@@ -120,12 +120,14 @@ to datasources of type `loki` that the service account can see.
 ## Benchmarks
 
 <!-- BENCH:START -->
-| Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors | Notes |
-|---|---|---|---|---|---|
-| S0 | 2.558 / 3.12 | 4.267 / 6.467 | 0 | 0 | fake Grafana — server overhead only |
-| S1 | 42.196 / 51.691 | 41.361 / 44.81 | 0 | 0 | self-hosted Grafana + Loki |
-| S2 | 35.947 / 46.56 | 36.839 / 40.172 | 0 | 0 | self-hosted Grafana + Loki |
-| S3 | 32.107 / 42.83 | 51.055 / 70.658 | 0 | 0 | self-hosted Grafana + Loki |
+| Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors |
+|---|---|---|---|---|
+| S0 | 2.558 / 3.12 | 4.267 / 6.467 | 0 | 0 |
+| S1 | 42.196 / 51.691 | 41.361 / 44.81 | 0 | 0 |
+| S2 | 35.947 / 46.56 | 36.839 / 40.172 | 0 | 0 |
+| S3 | 32.107 / 42.83 | 51.055 / 70.658 | 0 | 0 |
+
+S0 runs against a fake Grafana and measures server overhead only. S1, S2, S3 ran against a self-hosted Grafana + Loki stack. Not run: S4.
 
 | Metric | Go | Python |
 |---|---|---|
@@ -136,16 +138,25 @@ to datasources of type `loki` that the service account can see.
 | S3 points per series | 301 | 3601 |
 | S3 response size (KB) | 9.5 | 239.7 |
 
-Measured on 4 vCPU Intel(R) Core(TM) Ultra 7 265KF, 8 GB RAM, against a self-hosted Grafana + Loki stack (S1-S3; S4 not run), commit 009961a, 2026-10-14T07:11:11Z. Python = the FastMCP reference implementation this project replaces. Full report: docs/benchmarks.md
+Measured on 4 vCPU Intel(R) Core(TM) Ultra 7 265KF, 8 GB RAM, against a self-hosted Grafana + Loki stack, commit 009961a, 2026-10-14T07:11:11Z. Python = the FastMCP reference implementation this project replaces. Full report: docs/benchmarks.md
 <!-- BENCH:END -->
 
 The numbers are produced by `cmd/bench`, which drives both this server and the
 FastMCP reference implementation through their MCP interfaces, so the figures
-include MCP overhead. `scripts/bench.sh` runs S0 (against a fake Grafana, to
-isolate server cost) and S1-S4 (against a real Grafana). These figures are a preliminary run: S4 and a run against Grafana Cloud are still to come. Raw output is gitignored
-and never published: `cmd/benchreport` refuses to render a value that matches a
-deny pattern or carries an address, and `scripts/denylist-scan.sh` scans both the
-working tree and the whole history before a release.
+include MCP overhead. `scripts/bench.sh` runs S0 against a fake Grafana (server
+cost only, with a dummy token), then S1-S3 and then S4 on its own against the
+Grafana named by `GRAFANA_URL`; the report says which upstream that was
+(`BENCH_UPSTREAM`) and which scenarios did not run. These figures are a
+preliminary run: S4 and a run against Grafana Cloud are still to come.
+
+Raw output is gitignored and never published: `cmd/benchreport` refuses to
+render a value that matches a deny pattern or carries an address. Before a
+release, `scripts/denylist-scan.sh` (a wrapper around `go run ./cmd/denyscan`)
+scans the working tree, every commit's added lines and every author, committer
+and message. Extra patterns come from a local, gitignored `.denylist.local`
+(`--require-local` fails when it is missing); `--self-test` proves the scanner
+catches seeded canaries. A history hit that is a known false positive is
+acknowledged in `.denyscan-allow` as `<commit prefix> <path>`.
 
 ## Tests
 

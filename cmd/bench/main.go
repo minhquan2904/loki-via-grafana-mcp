@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -24,6 +25,13 @@ import (
 // restBetweenTargets is the pause contract C8 asks for between the two targets
 // of S4, so the upstream does not see one continuous burst.
 const restBetweenTargets = 30 * time.Second
+
+// callTimeout bounds one tool call, so a hung upstream cannot stall the run.
+const callTimeout = 2 * time.Minute
+
+// minGuardCalls is how many calls the running error rate needs before it can
+// stop a run; below that one early failure would end it.
+const minGuardCalls = 10
 
 type target struct {
 	name string
@@ -96,8 +104,12 @@ func run(args []string, environ []string) error {
 		return err
 	}
 
+	// Rows are written after every scenario, so a run that stops on the error
+	// guard still leaves the scenarios it finished.
+	if err := os.WriteFile(opts.out, nil, 0o644); err != nil {
+		return err
+	}
 	ctx := context.Background()
-	var rows []Row
 	for _, scenario := range opts.scenarios {
 		var measured []Row
 		if scenario == "S4" {
@@ -108,9 +120,32 @@ func run(args []string, environ []string) error {
 		if err != nil {
 			return err
 		}
-		rows = append(rows, measured...)
+		if err := appendRows(opts.out, measured); err != nil {
+			return err
+		}
 	}
-	return writeRows(opts.out, rows)
+	return nil
+}
+
+// errorGuard watches the running error rate of one target in one scenario and
+// trips as soon as it exceeds the limit, so a broken upstream is not hammered
+// until the scenario ends.
+type errorGuard struct {
+	target, scenario string
+	max              float64
+	calls, failed    atomic.Int64
+}
+
+func (g *errorGuard) record(got sample) error {
+	n := g.calls.Add(1)
+	failed := g.failed.Load()
+	if got.failed {
+		failed = g.failed.Add(1)
+	}
+	if n >= minGuardCalls && float64(failed)/float64(n) > g.max {
+		return fmt.Errorf("%s/%s error rate %.2f after %d calls exceeds the limit %.2f; stopping", g.target, g.scenario, float64(failed)/float64(n), n, g.max)
+	}
+	return nil
 }
 
 // fakeGrafanaFlag reports the --fake-grafana value without validating the rest of
@@ -236,6 +271,10 @@ func measureSequential(ctx context.Context, opts options, scenario, token string
 	}
 
 	samples := make(map[string][]sample, len(opts.targets))
+	guards := make(map[string]*errorGuard, len(opts.targets))
+	for _, tgt := range opts.targets {
+		guards[tgt.name] = &errorGuard{target: tgt.name, scenario: scenario, max: opts.maxErrorRate}
+	}
 	total := opts.warmup + opts.iterations
 	for round := range total {
 		order := opts.targets
@@ -243,8 +282,8 @@ func measureSequential(ctx context.Context, opts options, scenario, token string
 			order = reversed(opts.targets)
 		}
 		for _, tgt := range order {
-			got, err := workers[tgt.name].call(ctx, args)
-			if err != nil {
+			got := workers[tgt.name].call(ctx, args)
+			if err := guards[tgt.name].record(got); err != nil {
 				return nil, err
 			}
 			if round < opts.warmup {
@@ -256,7 +295,7 @@ func measureSequential(ctx context.Context, opts options, scenario, token string
 
 	rows := make([]Row, 0, len(opts.targets))
 	for _, tgt := range opts.targets {
-		row := buildRow(tgt.name, scenario, 1, samples[tgt.name])
+		row := buildRow(tgt.name, scenario, 1, samples[tgt.name], 0)
 		if err := checkErrorRate(row, opts.maxErrorRate); err != nil {
 			return nil, err
 		}
@@ -280,6 +319,9 @@ func measureConcurrent(ctx context.Context, opts options, token string) ([]Row, 
 		var wg sync.WaitGroup
 		var firstErr error
 		var errOnce sync.Once
+		var stopped atomic.Bool
+		guard := &errorGuard{target: tgt.name, scenario: "S4", max: opts.maxErrorRate}
+		started := time.Now()
 
 		for workerIndex := range opts.concurrencyS4 {
 			wg.Add(1)
@@ -293,16 +335,21 @@ func measureConcurrent(ctx context.Context, opts options, token string) ([]Row, 
 				defer w.close()
 
 				for range opts.roundsS4 {
-					got, err := w.call(ctx, args)
-					if err != nil {
+					if stopped.Load() {
+						return
+					}
+					got := w.call(ctx, args)
+					perWorker[workerIndex] = append(perWorker[workerIndex], got)
+					if err := guard.record(got); err != nil {
+						stopped.Store(true)
 						errOnce.Do(func() { firstErr = err })
 						return
 					}
-					perWorker[workerIndex] = append(perWorker[workerIndex], got)
 				}
 			}(workerIndex)
 		}
 		wg.Wait()
+		wall := time.Since(started)
 		if firstErr != nil {
 			return nil, firstErr
 		}
@@ -311,7 +358,7 @@ func measureConcurrent(ctx context.Context, opts options, token string) ([]Row, 
 		for _, got := range perWorker {
 			samples = append(samples, got...)
 		}
-		row := buildRow(tgt.name, "S4", opts.concurrencyS4, samples)
+		row := buildRow(tgt.name, "S4", opts.concurrencyS4, samples, wall)
 		if err := checkErrorRate(row, opts.maxErrorRate); err != nil {
 			return nil, err
 		}
@@ -330,7 +377,10 @@ type sample struct {
 	failed    bool
 }
 
-func buildRow(target, scenario string, concurrency int, samples []sample) Row {
+// buildRow summarizes samples. wall is the elapsed wall-clock time for a
+// concurrent scenario; zero means the calls ran one after another, so their
+// latencies add up to the elapsed time.
+func buildRow(target, scenario string, concurrency int, samples []sample, wall time.Duration) Row {
 	latencies := make([]float64, 0, len(samples))
 	sizes := make([]float64, 0, len(samples))
 	lineCounts := make([]float64, 0, len(samples))
@@ -366,6 +416,9 @@ func buildRow(target, scenario string, concurrency int, samples []sample) Row {
 		RespBytesP50:       nearestRank(sizes, 0.50),
 		PointsPerSeriesMax: points,
 		LinesP50:           nearestRank(lineCounts, 0.50),
+	}
+	if wall > 0 {
+		elapsed = float64(wall.Microseconds()) / 1000
 	}
 	if elapsed > 0 {
 		row.RPS = round3(float64(len(samples)) / (elapsed / 1000))
@@ -406,12 +459,21 @@ func (w *worker) close() {
 	_ = w.session.Close()
 }
 
-func (w *worker) call(ctx context.Context, args map[string]any) (sample, error) {
+// call runs one query. A transport failure (HTTP 429/503, a reset, the call
+// timeout) is a failed sample, not the end of the run; the error guard decides
+// when there are too many.
+func (w *worker) call(ctx context.Context, args map[string]any) sample {
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 	start := time.Now()
 	res, err := w.session.CallTool(ctx, &mcp.CallToolParams{Name: "query_logs", Arguments: args})
 	elapsed := time.Since(start)
 	if err != nil {
-		return sample{}, fmt.Errorf("%s: call: %w", w.name, err)
+		return sample{
+			latencyMS: float64(elapsed.Microseconds()) / 1000,
+			failed:    true,
+			throttled: isThrottled(err.Error()),
+		}
 	}
 
 	text := textOf(res)
@@ -421,11 +483,16 @@ func (w *worker) call(ctx context.Context, args map[string]any) (sample, error) 
 	}
 	if res.IsError {
 		got.failed = true
-		got.throttled = strings.Contains(text, "429")
-		return got, nil
+		got.throttled = isThrottled(text)
+		return got
 	}
 	got.lines, got.points = decodeCounts(text)
-	return got, nil
+	return got
+}
+
+// isThrottled recognizes an upstream or server rate limit in an error text.
+func isThrottled(text string) bool {
+	return strings.Contains(text, "429") || strings.Contains(text, "Too Many Requests")
 }
 
 type toolResult struct {
@@ -493,7 +560,12 @@ func scenarioArgs(scenario string, opts options) map[string]any {
 	return nil
 }
 
-func writeRows(path string, rows []Row) error {
+func appendRows(path string, rows []Row) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	var out strings.Builder
 	for _, row := range rows {
 		raw, err := json.Marshal(row)
@@ -503,7 +575,8 @@ func writeRows(path string, rows []Row) error {
 		out.Write(raw)
 		out.WriteString("\n")
 	}
-	return os.WriteFile(path, []byte(out.String()), 0o644)
+	_, err = f.WriteString(out.String())
+	return err
 }
 
 func reversed(targets []target) []target {

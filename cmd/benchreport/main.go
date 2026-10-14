@@ -53,22 +53,19 @@ type meta struct {
 	GoSDKVersion  string  `json:"gosdk_version"`
 	Commit        string  `json:"commit"`
 	Timestamp     string  `json:"timestamp"`
+	// Upstream describes, in neutral words, the Grafana that S1-S4 ran against
+	// ("a self-hosted Grafana + Loki", "Grafana Cloud"). It is printed as is,
+	// after the deny check, so the report never claims a stack it did not use.
+	Upstream string `json:"upstream"`
 }
 
 type extra struct {
-	ImageSizeMB map[string]float64            `json:"image_size_mb"`
-	ColdStartMS map[string]float64            `json:"cold_start_ms"`
-	RSSMB       map[string]map[string]float64 `json:"rss_mb"`
+	ImageSizeMB map[string]float64             `json:"image_size_mb"`
+	ColdStartMS map[string]float64             `json:"cold_start_ms"`
+	RSSMB       map[string]map[string]*float64 `json:"rss_mb"` // nil or 0 = not measured
 }
 
 // scenarios in report order, with the note the contract asks for.
-var scenarioNotes = map[string]string{
-	"S0": "fake Grafana — server overhead only",
-	"S1": "real Grafana Cloud Loki",
-	"S2": "real Grafana Cloud Loki",
-	"S3": "real Grafana Cloud Loki",
-	"S4": "real Grafana Cloud Loki",
-}
 
 var scenarioOrder = []string{"S0", "S1", "S2", "S3", "S4"}
 
@@ -99,8 +96,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// Single source of the patterns for scripts/denylist-scan.sh. The local
-	// .denylist.local file is deliberately not read here: the scanner adds it.
+	// Prints the built-in patterns (plus -redact-file), for a human checking what
+	// the report refuses. The repository scanner is cmd/denyscan.
 	if *printDenylist {
 		for _, pattern := range denylist.Patterns() {
 			fmt.Fprintln(stdout, pattern)
@@ -138,6 +135,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	if strings.TrimSpace(metaDoc.Upstream) == "" {
+		fmt.Fprintln(stderr, `benchreport: meta.upstream is required: say which Grafana S1-S4 ran against, e.g. "a self-hosted Grafana + Loki"`)
+		return 2
+	}
 
 	body := render(rows, metaDoc, extraDoc)
 
@@ -145,7 +146,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "benchreport:", err)
 		return 1
 	}
-	if err := os.WriteFile(*docPath, []byte(docHeader+body), 0o644); err != nil {
+	if err := os.WriteFile(*docPath, []byte(docHeader+body+"\n"+renderRaw(rows)), 0o644); err != nil {
 		fmt.Fprintln(stderr, "benchreport:", err)
 		return 2
 	}
@@ -262,21 +263,33 @@ func findSensitive(value any, path string, denylist *redact.Denylist) (string, b
 func render(rows []row, metaDoc meta, extraDoc extra) string {
 	var out strings.Builder
 
-	out.WriteString("| Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors | Notes |\n")
-	out.WriteString("|---|---|---|---|---|---|\n")
+	out.WriteString("| Scenario | Go p50 / p95 (ms) | Python p50 / p95 (ms) | Go errors | Python errors |\n")
+	out.WriteString("|---|---|---|---|---|\n")
+	var missing, real []string
 	for _, scenario := range scenarioOrder {
 		goRow, hasGo := findRow(rows, "go", scenario)
 		pyRow, hasPy := findRow(rows, "python", scenario)
 		if !hasGo && !hasPy {
+			missing = append(missing, scenario)
 			continue
 		}
+		if scenario != "S0" {
+			real = append(real, scenario)
+		}
 		out.WriteString("| " + scenario + " | " + latency(goRow, hasGo) + " | " + latency(pyRow, hasPy) +
-			" | " + errorsOf(goRow, hasGo) + " | " + errorsOf(pyRow, hasPy) +
-			" | " + scenarioNotes[scenario] + " |\n")
+			" | " + errorsOf(goRow, hasGo) + " | " + errorsOf(pyRow, hasPy) + " |\n")
 	}
+	out.WriteString("\nS0 runs against a fake Grafana and measures server overhead only.")
+	if len(real) > 0 {
+		out.WriteString(" " + strings.Join(real, ", ") + " ran against " + metaDoc.Upstream + ".")
+	}
+	if len(missing) > 0 {
+		out.WriteString(" Not run: " + strings.Join(missing, ", ") + ".")
+	}
+	out.WriteString("\n")
 
 	out.WriteString("\n| Metric | Go | Python |\n|---|---|---|\n")
-	out.WriteString("| Image size (MB) | " + megabytes(extraDoc.ImageSizeMB, "go") + " | " + megabytes(extraDoc.ImageSizeMB, "python") + " |\n")
+	out.WriteString("| Image size, compressed (MB) | " + megabytes(extraDoc.ImageSizeMB, "go") + " | " + megabytes(extraDoc.ImageSizeMB, "python") + " |\n")
 	out.WriteString("| Cold start to /healthz (ms) | " + milliseconds(extraDoc.ColdStartMS, "go") + " | " + milliseconds(extraDoc.ColdStartMS, "python") + " |\n")
 	out.WriteString("| RSS idle (MB) | " + rss(extraDoc.RSSMB, "go", "idle") + " | " + rss(extraDoc.RSSMB, "python", "idle") + " |\n")
 	out.WriteString("| RSS peak under S4 (MB) | " + rss(extraDoc.RSSMB, "go", "peak") + " | " + rss(extraDoc.RSSMB, "python", "peak") + " |\n")
@@ -284,10 +297,34 @@ func render(rows []row, metaDoc meta, extraDoc extra) string {
 	out.WriteString("| S3 response size (KB) | " + responseKB(rows, "go") + " | " + responseKB(rows, "python") + " |\n")
 
 	out.WriteString("\nMeasured on " + strconv.Itoa(metaDoc.VCPU) + " vCPU " + metaDoc.CPUModel + ", " +
-		trimFloat(metaDoc.RAMGB) + " GB RAM, against a Loki datasource on Grafana Cloud, commit " +
+		trimFloat(metaDoc.RAMGB) + " GB RAM, against " + metaDoc.Upstream + ", commit " +
 		shortCommit(metaDoc.Commit) + ", " + metaDoc.Timestamp + ". " +
 		"Python = the FastMCP reference implementation this project replaces. Full report: docs/benchmarks.md\n")
 
+	return out.String()
+}
+
+// renderRaw lists every measured row for docs/benchmarks.md, which is the full
+// report the README summary points to.
+func renderRaw(rows []row) string {
+	var out strings.Builder
+	out.WriteString("## All measurements\n\n")
+	out.WriteString("| Target | Scenario | Concurrency | n | Errors | Throttled | p50 (ms) | p95 (ms) | Max (ms) | RPS | Response p50 (bytes) | Lines p50 | Points per series |\n")
+	out.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, scenario := range scenarioOrder {
+		for _, target := range []string{"go", "python"} {
+			entry, ok := findRow(rows, target, scenario)
+			if !ok {
+				continue
+			}
+			out.WriteString("| " + strings.Join([]string{
+				entry.Target, entry.Scenario, strconv.Itoa(entry.Concurrency), strconv.Itoa(entry.N),
+				strconv.Itoa(entry.Errors), strconv.Itoa(entry.Throttled),
+				trimFloat(entry.P50MS), trimFloat(entry.P95MS), trimFloat(entry.MaxMS), trimFloat(entry.RPS),
+				trimFloat(entry.RespBytesP50), trimFloat(entry.LinesP50), strconv.Itoa(entry.PointsPerSeriesMax),
+			}, " | ") + " |\n")
+		}
+	}
 	return out.String()
 }
 
@@ -333,20 +370,14 @@ func milliseconds(values map[string]float64, key string) string {
 	return trimFloat(value)
 }
 
-func rss(values map[string]map[string]float64, target, kind string) string {
-	perTarget, ok := values[target]
-	if !ok {
-		return "—"
+func rss(values map[string]map[string]*float64, target, kind string) string {
+	value := values[target][kind]
+	// A process never has an RSS of zero, so 0 and null both mean the sample
+	// was not taken (the peak, say, when S4 did not run).
+	if value == nil || *value == 0 {
+		return "not measured"
 	}
-	value, ok := perTarget[kind]
-	if !ok {
-		return "—"
-	}
-	// S4 is opt-in, so a peak of zero means "not measured" rather than "zero".
-	if value == 0 {
-		return "—"
-	}
-	return trimFloat(value)
+	return trimFloat(*value)
 }
 
 func points(rows []row, target string) string {
