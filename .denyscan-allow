@@ -1,0 +1,7 @@
+# Acknowledged history hits: "<commit prefix> <path>", one per line.
+# Each entry was reviewed; it silences that file in that commit only.
+#
+# 009961a: cmd/benchreport/main_test.go asserted on a synthetic private IPv4
+# literal (an RFC 1918 test value, not a real host). The test now builds it at
+# run time.
+009961a13626 cmd/benchreport/main_test.go
