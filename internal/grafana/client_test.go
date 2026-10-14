@@ -230,13 +230,16 @@ func TestClient_ExactlyTwoMethods(t *testing.T) {
 // TestNewClient_SetsCheckRedirect covers both construction paths: a caller
 // supplied client gets the redirect policy forced on it.
 func TestNewClient_SetsCheckRedirect(t *testing.T) {
-	supplied := &http.Client{}
+	supplied := &http.Client{Timeout: 7 * time.Second}
 	client := NewClient("https://grafana.test", testToken, time.Second, supplied)
-	if supplied.CheckRedirect == nil {
-		t.Fatalf("supplied client kept a nil CheckRedirect")
+	if supplied.CheckRedirect != nil {
+		t.Fatalf("the caller's client was modified")
 	}
-	if client.httpClient != supplied {
-		t.Fatalf("supplied client was not used")
+	if client.httpClient.CheckRedirect == nil {
+		t.Fatalf("the client has no redirect policy")
+	}
+	if client.httpClient.Timeout != 7*time.Second {
+		t.Fatalf("settings of the supplied client were not kept")
 	}
 
 	fresh := NewClient("https://grafana.test/", testToken, time.Second, nil)
@@ -245,5 +248,54 @@ func TestNewClient_SetsCheckRedirect(t *testing.T) {
 	}
 	if fresh.baseURL != "https://grafana.test" {
 		t.Fatalf("baseURL = %q, want the trailing slash trimmed", fresh.baseURL)
+	}
+}
+
+func TestDSQuery_LokiErrorNeverLeaksToken(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := json.Marshal(map[string]any{
+			"results": map[string]any{"A": map[string]any{"error": "parse error near " + r.Header.Get("Authorization")}},
+		})
+		_, _ = w.Write(payload)
+	})
+	_, err := client.DSQuery(context.Background(), map[string]any{})
+	if err == nil || !strings.HasPrefix(err.Error(), "Loki error: ") {
+		t.Fatalf("err = %v, want a Loki error", err)
+	}
+	if strings.Contains(err.Error(), testToken) || !strings.Contains(err.Error(), "[redacted]") {
+		t.Fatalf("Loki error is not scrubbed: %q", err.Error())
+	}
+}
+
+func TestClient_TransportErrorHidesAddress(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	addr := server.Listener.Addr().String()
+	server.Close() // nothing listens there any more
+	client := NewClient(server.URL, testToken, 2*time.Second, nil)
+
+	_, err := client.ListDatasources(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "Grafana request failed: ") {
+		t.Fatalf("err = %v, want a transport error", err)
+	}
+	host, port, _ := strings.Cut(addr, ":")
+	if strings.Contains(err.Error(), addr) || strings.Contains(err.Error(), ":"+port) || strings.Contains(err.Error(), "/api/") {
+		t.Fatalf("transport error exposes the upstream (%s): %q", host, err.Error())
+	}
+}
+
+func TestListDatasources_SortIsDeterministic(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"uid":"b","name":"same","type":"loki"},{"uid":"a","name":"same","type":"loki"},{"uid":"c","name":"alpha","type":"loki"}]`))
+	})
+	got, err := client.ListDatasources(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uids []string
+	for _, ds := range got {
+		uids = append(uids, ds.UID)
+	}
+	if strings.Join(uids, ",") != "c,a,b" {
+		t.Fatalf("order = %v, want name then uid", uids)
 	}
 }

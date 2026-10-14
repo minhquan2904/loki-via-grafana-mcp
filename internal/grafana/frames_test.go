@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// frameStart is the first timestamp of every fixture: 2026-10-07T01:20:00Z.
+// frameStart is the first timestamp of every fixture: 2025-10-07T01:20:00Z.
 const frameStart = 1759800000000
 
 func loadFrame(t *testing.T, name string) json.RawMessage {
@@ -210,5 +210,89 @@ func TestFinish_SeriesUntouched(t *testing.T) {
 	result.Finish("backward", 1)
 	if after := fmt.Sprintf("%#v", result.Series); after != before {
 		t.Fatalf("Finish mutated series: %s", after)
+	}
+}
+
+// rawFrame builds a frame from field specs and columns for the ragged cases.
+func rawFrame(t *testing.T, fields []map[string]any, values [][]any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"schema": map[string]any{"fields": fields},
+		"data":   map[string]any{"values": values},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestParseFrames_LogFrameWithoutTimeColumn(t *testing.T) {
+	frame := rawFrame(t,
+		[]map[string]any{{"name": "Line", "type": "string"}},
+		[][]any{{"a", "b"}},
+	)
+	result, err := ParseFrames([]json.RawMessage{frame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Logs) != 2 || result.Logs[0].Time != "" || result.Logs[1].Line != "b" {
+		t.Fatalf("logs = %+v, want 2 lines with empty time", result.Logs)
+	}
+}
+
+func TestParseFrames_LogFrameShortTimeColumn(t *testing.T) {
+	frame := rawFrame(t,
+		[]map[string]any{{"name": "Time", "type": "time"}, {"name": "Line", "type": "string"}},
+		[][]any{{frameStart}, {"a", "b", "c"}},
+	)
+	result, err := ParseFrames([]json.RawMessage{frame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"2025-10-07T01:20:00.000Z", "", ""}
+	for i, entry := range result.Logs {
+		if entry.Time != want[i] {
+			t.Errorf("logs[%d].Time = %q, want %q", i, entry.Time, want[i])
+		}
+	}
+	if len(result.Logs) != 3 {
+		t.Fatalf("got %d logs, want 3", len(result.Logs))
+	}
+}
+
+func TestParseFrames_MetricFrameRaggedColumns(t *testing.T) {
+	frame := rawFrame(t,
+		[]map[string]any{{"name": "Time", "type": "time"}, {"name": "Value", "type": "number"}},
+		[][]any{{frameStart, "not-a-time"}, {1, 2, 3}},
+	)
+	result, err := ParseFrames([]json.RawMessage{frame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Type != "series" || len(result.Series) != 1 {
+		t.Fatalf("result = %+v, want one series", result)
+	}
+	values := result.Series[0].Values
+	if len(values) != 1 || values[0][0] != "2025-10-07T01:20:00.000Z" || values[0][1] != 1.0 {
+		t.Fatalf("values = %v, want only the first row", values)
+	}
+}
+
+func TestParseFrames_NaNStringBecomesNull(t *testing.T) {
+	frame := rawFrame(t,
+		[]map[string]any{{"name": "Time", "type": "time"}, {"name": "Value", "type": "number"}},
+		[][]any{{frameStart, frameStart + 1000}, {"NaN", "+Inf"}},
+	)
+	result, err := ParseFrames([]json.RawMessage{frame})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range result.Series[0].Values {
+		if point[1] != nil {
+			t.Errorf("value = %v, want nil", point[1])
+		}
+	}
+	if _, err := json.Marshal(result); err != nil {
+		t.Fatalf("result does not encode: %v", err)
 	}
 }

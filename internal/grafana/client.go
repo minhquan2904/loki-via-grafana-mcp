@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -41,6 +43,9 @@ type Client struct {
 func NewClient(baseURL, token string, timeout time.Duration, hc *http.Client) *Client {
 	if hc == nil {
 		hc = &http.Client{Timeout: timeout}
+	} else {
+		copied := *hc // do not change the caller's client
+		hc = &copied
 	}
 	hc.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -64,7 +69,7 @@ func (c *Client) DSQuery(ctx context.Context, payload map[string]any) ([]json.Ra
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.do(req)
+	resp, err := c.do(req, "/api/ds/query")
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +96,7 @@ func (c *Client) DSQuery(ctx context.Context, payload map[string]any) ([]json.Ra
 
 	result := parsed.Results["A"]
 	if result.Error != "" {
-		return nil, fmt.Errorf("Loki error: %s", truncateRunes(result.Error, maxErrorRunes))
+		return nil, fmt.Errorf("Loki error: %s", c.scrub(result.Error))
 	}
 	if result.Frames == nil {
 		return []json.RawMessage{}, nil
@@ -107,7 +112,7 @@ func (c *Client) ListDatasources(ctx context.Context) ([]Datasource, error) {
 		return nil, err
 	}
 
-	resp, err := c.do(req)
+	resp, err := c.do(req, "/api/datasources")
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +137,12 @@ func (c *Client) ListDatasources(ctx context.Context) ([]Datasource, error) {
 		}
 		loki = append(loki, Datasource{UID: entry.UID, Name: entry.Name, IsDefault: entry.IsDefault})
 	}
-	sort.Slice(loki, func(i, j int) bool { return loki[i].Name < loki[j].Name })
+	sort.Slice(loki, func(i, j int) bool {
+		if loki[i].Name != loki[j].Name {
+			return loki[i].Name < loki[j].Name
+		}
+		return loki[i].UID < loki[j].UID
+	})
 	return loki, nil
 }
 
@@ -153,15 +163,15 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 }
 
 // do executes the request, turning transport errors and redirects into errors.
-func (c *Client) do(req *http.Request) (*http.Response, error) {
+func (c *Client) do(req *http.Request, path string) (*http.Response, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("Grafana request failed: %w", err)
+		return nil, transportError(err)
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		location := redirectHost(resp.Header.Get("Location"))
 		resp.Body.Close()
-		return nil, fmt.Errorf("Grafana %s %d: redirect to %s refused (check GRAFANA_URL / proxy auth)", req.URL.Path, resp.StatusCode, location)
+		return nil, fmt.Errorf("Grafana %s %d: redirect to %s refused (check GRAFANA_URL / proxy auth)", path, resp.StatusCode, location)
 	}
 	return resp, nil
 }
@@ -195,10 +205,38 @@ func (c *Client) errorText(raw []byte) string {
 			text = parsed.Message
 		}
 	}
+	return c.scrub(text)
+}
+
+// scrub removes the service account token from text and cuts it to
+// maxErrorRunes, so no upstream text can carry the token into an error.
+func (c *Client) scrub(text string) string {
 	if c.token != "" {
 		text = strings.ReplaceAll(text, c.token, "[redacted]")
 	}
 	return truncateRunes(text, maxErrorRunes)
+}
+
+// transportError describes a failed round trip without the request URL or the
+// dialed address, which *url.Error and *net.OpError would otherwise expose to
+// the MCP caller.
+func transportError(err error) error {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return errors.New("Grafana request failed: cannot resolve the Grafana host")
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	for {
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) {
+			break
+		}
+		err = opErr.Err
+	}
+	return fmt.Errorf("Grafana request failed: %w", err)
 }
 
 // redirectHost reduces a Location header to its host, so a redirect to an SSO

@@ -4,6 +4,7 @@ package grafana
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -92,6 +93,10 @@ func parseRelative(s string) (time.Duration, bool) {
 	default:
 		return 0, false
 	}
+	// A huge n would wrap around int64 and land on an unrelated window.
+	if int64(n) > math.MaxInt64/int64(unitDuration) {
+		return 0, false
+	}
 	return time.Duration(n) * unitDuration, true
 }
 
@@ -118,6 +123,10 @@ func ParseStep(s string) (time.Duration, error) {
 	}
 	var d time.Duration
 	if n, err := strconv.Atoi(s); err == nil {
+		// Bound n before multiplying so a huge value cannot wrap into range.
+		if n < 1 || n > 86400 {
+			return 0, invalidStep(s)
+		}
 		d = time.Duration(n) * time.Second
 	} else {
 		parsed, err := time.ParseDuration(s)

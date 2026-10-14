@@ -59,6 +59,8 @@ func TestResolveTime_Invalid(t *testing.T) {
 		"2026-10-07",
 		"2026-13-07T10:00:00Z",
 		"12:00:00",
+		"now-36028797018967568s", // 2^55+3600 seconds wraps to 1h without the bound
+		"now-9223372036854775807w",
 	}
 	for _, value := range values {
 		t.Run(value, func(t *testing.T) {
@@ -100,7 +102,7 @@ func TestParseStep(t *testing.T) {
 		})
 	}
 
-	bad := []string{"-5s", "0", "abc", "500ms", "25h", "1.5s"}
+	bad := []string{"-5s", "0", "abc", "500ms", "25h", "1.5s", "86401", "36028797018963969"}
 	for _, in := range bad {
 		t.Run("bad/"+in, func(t *testing.T) {
 			_, err := ParseStep(in)

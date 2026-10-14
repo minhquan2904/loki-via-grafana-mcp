@@ -3,6 +3,7 @@ package grafana
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 )
@@ -118,8 +119,9 @@ func parseLogFrame(f frame) ([]LogLine, bool) {
 			line = string(runes[:MaxLineChars])
 			truncated = true
 		}
+		time, _ := decodeTime(rawAt(f, timeIdx, i))
 		logs = append(logs, LogLine{
-			Time:      FormatTime(decodeFloat(column(f, timeIdx)[i])),
+			Time:      time,
 			Line:      line,
 			Labels:    parseLabels(rawAt(f, labelsIdx, i)),
 			Truncated: truncated,
@@ -139,10 +141,17 @@ func parseMetricFrame(f frame) []Series {
 		if field.Type != "number" {
 			continue
 		}
+		// Columns may be ragged; pair rows only while both have a cell, and skip
+		// rows whose time is not a number rather than inventing a 1970 point.
 		col := column(f, idx)
-		values := make([][2]any, 0, len(col))
-		for i, raw := range col {
-			values = append(values, [2]any{FormatTime(decodeFloat(rawAt(f, timeIdx, i))), decodeValue(raw)})
+		rows := min(len(col), len(column(f, timeIdx)))
+		values := make([][2]any, 0, rows)
+		for i := range rows {
+			time, ok := decodeTime(rawAt(f, timeIdx, i))
+			if !ok {
+				continue
+			}
+			values = append(values, [2]any{time, decodeValue(col[i])})
 		}
 		series = append(series, Series{
 			Labels: labelsToStrings(field.Labels),
@@ -209,14 +218,13 @@ func decodeString(raw json.RawMessage) string {
 	return fmt.Sprint(v)
 }
 
-// decodeFloat renders a raw value as epoch milliseconds. Anything that is not a
-// number (or a numeric string) becomes 0.
-func decodeFloat(raw json.RawMessage) float64 {
-	v := decodeValue(raw)
-	if f, ok := v.(float64); ok {
-		return f
+// decodeTime renders a raw epoch-milliseconds cell with FormatTime. A missing
+// or non-numeric cell yields "" and false.
+func decodeTime(raw json.RawMessage) (string, bool) {
+	if f, ok := decodeValue(raw).(float64); ok {
+		return FormatTime(f), true
 	}
-	return 0
+	return "", false
 }
 
 // decodeValue renders a raw value as a float64 or nil.
@@ -232,7 +240,8 @@ func decodeValue(raw json.RawMessage) any {
 	case float64:
 		return typed
 	case string:
-		if f, err := strconv.ParseFloat(typed, 64); err == nil {
+		// "NaN" and "Inf" parse but cannot be encoded as JSON numbers.
+		if f, err := strconv.ParseFloat(typed, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			return f
 		}
 		return nil
