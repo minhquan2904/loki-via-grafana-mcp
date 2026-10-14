@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -50,6 +51,7 @@ func TestLoad_GrafanaURLValidation(t *testing.T) {
 		{"no-scheme", "//grafana.test", "GRAFANA_URL must be an absolute http(s) URL"},
 		{"bad-scheme", "ftp://grafana.test", "GRAFANA_URL must be an absolute http(s) URL"},
 		{"no-host", "https://", "GRAFANA_URL must be an absolute http(s) URL"},
+		{"userinfo", "https://admin:hunter2@grafana.test", "GRAFANA_URL must not contain credentials; use GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,6 +247,14 @@ func TestLoad_AllowedOrigins(t *testing.T) {
 	if got != want {
 		t.Fatalf("AllowedOrigins = %q, want %q", got, want)
 	}
+
+	upper, err := Load(baseEnv("MCP_ALLOWED_HOSTS=Example.TEST:8000"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := strings.Join(upper.AllowedOrigins, ","); got != "http://example.test:8000,https://example.test:8000" {
+		t.Fatalf("AllowedOrigins = %q, want lower case", got)
+	}
 }
 
 func TestLoad_UserHeader(t *testing.T) {
@@ -414,6 +424,9 @@ func TestConfig_StringAndLogValueRedact(t *testing.T) {
 	text := cfg.LogValue().String()
 	if strings.Contains(text, cfg.GrafanaToken) || strings.Contains(text, cfg.AuthToken) {
 		t.Fatalf("LogValue() leaks a token: %s", text)
+	}
+	if gs := fmt.Sprintf("%#v", cfg); strings.Contains(gs, cfg.GrafanaToken) || strings.Contains(gs, cfg.AuthToken) {
+		t.Fatalf("%%#v leaks a token: %s", gs)
 	}
 	if !strings.Contains(cfg.String(), redacted) {
 		t.Fatalf("String() should show the redaction marker: %s", cfg.String())

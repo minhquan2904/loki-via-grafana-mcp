@@ -43,7 +43,7 @@ func New(o Options) *http.Server {
 				BearerAuth(o.Token,
 					BodyLimit(maxBodyBytes,
 						Limit(o.MaxConcurrent, o.MCP)))))))
-	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("GET /healthz", healthz) // other methods get 405
 
 	return &http.Server{
 		Addr:    o.Addr,

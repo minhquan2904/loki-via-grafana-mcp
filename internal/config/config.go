@@ -76,6 +76,10 @@ func Load(environ []string) (Config, error) {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return Config{}, fmt.Errorf("GRAFANA_URL must be an absolute http(s) URL")
 	}
+	if parsed.User != nil {
+		// Credentials in the URL would end up in logs; the token goes in its own variable.
+		return Config{}, fmt.Errorf("GRAFANA_URL must not contain credentials; use GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE")
+	}
 	c.GrafanaURL = strings.TrimRight(rawURL, "/")
 
 	token, err := resolveSecret(env, "GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE", "GRAFANA_SERVICE_ACCOUNT_TOKEN")
@@ -199,6 +203,9 @@ func (c Config) String() string {
 	)
 }
 
+// GoString keeps %#v from printing the tokens.
+func (c Config) GoString() string { return "config.Config{" + c.String() + "}" }
+
 // LogValue renders the configuration as a slog group with secrets redacted.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
@@ -288,6 +295,8 @@ func deriveOrigins(hosts []string) []string {
 		if strings.Contains(host, ":*") {
 			continue
 		}
+		// Browsers send the Origin host in lower case.
+		host = strings.ToLower(host)
 		origins = append(origins, "http://"+host, "https://"+host)
 	}
 	return origins

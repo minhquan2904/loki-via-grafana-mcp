@@ -4,9 +4,11 @@
 package httpserver
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,7 +18,8 @@ import (
 )
 
 // limitWait is how long a request may queue for a concurrency slot.
-const limitWait = 30 * time.Second
+// A var only so tests can shorten it.
+var limitWait = 30 * time.Second
 
 // HostCheck refuses a request whose Host header matches none of patterns, which
 // is the defence against DNS rebinding. Pattern forms (case-insensitive):
@@ -63,13 +66,31 @@ func BearerAuth(token string, next http.Handler) http.Handler {
 	})
 }
 
-// BodyLimit rejects a request that declares a body larger than n bytes with 413
-// and caps what the handler can read at n bytes. It never reads the body itself,
-// so a slow client cannot hold it up; it must run after authentication.
+// BodyLimit answers 413 to a body larger than n bytes. A declared length is
+// checked without reading; a body of unknown length (chunked) is read up to n+1
+// bytes here, so the refusal is our JSON 413 and not whatever the MCP handler
+// makes of a truncated read. It must run after authentication: only a client
+// holding the token can make the server read its body, and ReadTimeout bounds
+// how long that takes.
 func BodyLimit(n int64, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > n {
 			refuse(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if r.ContentLength < 0 {
+			buf, err := io.ReadAll(io.LimitReader(r.Body, n+1))
+			if err != nil {
+				refuse(w, "request body unreadable", http.StatusBadRequest)
+				return
+			}
+			if int64(len(buf)) > n {
+				refuse(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(buf))
+			r.ContentLength = int64(len(buf))
+			next.ServeHTTP(w, r)
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, n)
@@ -111,6 +132,9 @@ func AccessLog(log *slog.Logger, userHeader string, next http.Handler) http.Hand
 }
 
 func validBearer(r *http.Request, token string) bool {
+	if token == "" {
+		return false // an empty configured token must never authorize anyone
+	}
 	scheme, got, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !ok || !strings.EqualFold(scheme, "Bearer") {
 		return false
@@ -183,13 +207,21 @@ func hostAllowed(patterns []string, host string) bool {
 		if wantName != name {
 			continue
 		}
+		// A pattern that does not match falls through to the next one: the
+		// same host may be listed with several ports.
 		switch {
 		case wantPort == "*":
-			return hasPort
+			if hasPort {
+				return true
+			}
 		case wantHasPort:
-			return hasPort && wantPort == port
+			if hasPort && wantPort == port {
+				return true
+			}
 		default:
-			return !hasPort
+			if !hasPort {
+				return true
+			}
 		}
 	}
 	return false

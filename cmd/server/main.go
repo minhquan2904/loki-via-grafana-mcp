@@ -100,7 +100,9 @@ func run(ctx context.Context, args []string, environ []string, stdin io.Reader, 
 			"version", version,
 			"startup_ms", time.Since(start).Milliseconds(),
 		)
-		if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil {
+		err := srv.Run(ctx, &mcp.IOTransport{Reader: io.NopCloser(stdin), Writer: nopWriteCloser{stdout}})
+		// A signal (ctx done) or the client closing stdin is a clean stop.
+		if err != nil && ctx.Err() == nil && !errors.Is(err, io.EOF) {
 			logger.Error("stdio server stopped", "error", err.Error())
 			return exitRuntime
 		}
@@ -122,16 +124,22 @@ func run(ctx context.Context, args []string, environ []string, stdin io.Reader, 
 		MaxConcurrent:  cfg.MaxConcurrent,
 	})
 
+	// Bind before announcing readiness, so "ready" never precedes a bind error.
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		logger.Error("cannot listen", "addr", cfg.ListenAddr, "error", err.Error())
+		return exitRuntime
+	}
 	logger.Info("ready",
 		"transport", string(cfg.Transport),
-		"addr", cfg.ListenAddr,
+		"addr", ln.Addr().String(),
 		"grafana_host", grafanaHost(cfg.GrafanaURL),
 		"version", version,
 		"startup_ms", time.Since(start).Milliseconds(),
 	)
 
 	served := make(chan error, 1)
-	go func() { served <- httpSrv.ListenAndServe() }()
+	go func() { served <- httpSrv.Serve(ln) }()
 
 	select {
 	case err := <-served:
@@ -198,3 +206,8 @@ func grafanaHost(rawURL string) string {
 	}
 	return parsed.Host
 }
+
+// nopWriteCloser lets the stdio transport write to stdout without closing it.
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }

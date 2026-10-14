@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,5 +314,100 @@ func TestRun_HTTPEndToEnd(t *testing.T) {
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatalf("run did not return after the context was cancelled")
+	}
+}
+
+func TestRun_StdioCleanStop(t *testing.T) {
+	grafanaSrv := fakeGrafana(t)
+	env := baseEnv(grafanaSrv.URL)
+
+	t.Run("client closes stdin", func(t *testing.T) {
+		inR, inW := io.Pipe()
+		outR, outW := io.Pipe()
+		var stderr bytes.Buffer
+		done := make(chan int, 1)
+		go func() {
+			done <- run(context.Background(), nil, env, inR, outW, &stderr)
+			_ = outW.Close()
+		}()
+
+		init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}` + "\n"
+		if _, err := io.WriteString(inW, init); err != nil {
+			t.Fatal(err)
+		}
+		line, err := bufio.NewReader(outR).ReadString('\n')
+		if err != nil || !strings.Contains(line, `"id":1`) {
+			t.Fatalf("initialize response = %q, %v", line, err)
+		}
+		_ = inW.Close() // the client goes away
+		go func() { _, _ = io.Copy(io.Discard, outR) }()
+
+		select {
+		case code := <-done:
+			if code != exitOK {
+				t.Fatalf("exit = %d after stdin closed, want 0 (stderr %s)", code, stderr.String())
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("stdio server did not stop after stdin closed")
+		}
+	})
+
+	t.Run("signal while running", func(t *testing.T) {
+		pr, pw := io.Pipe()
+		defer pw.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan int, 1)
+		go func() { done <- run(ctx, nil, env, pr, io.Discard, io.Discard) }()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		select {
+		case code := <-done:
+			if code != exitOK {
+				t.Fatalf("exit = %d after a signal, want 0", code)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("stdio server did not stop")
+		}
+	})
+}
+
+func TestRun_NoGrafanaCallAtStartup(t *testing.T) {
+	var hits atomic.Int32
+	grafanaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(grafanaSrv.Close)
+	port := freePort(t)
+	env := append(baseEnv(grafanaSrv.URL),
+		"MCP_TRANSPORT=http", "MCP_TOKEN="+testMCPToken, "MCP_LISTEN=127.0.0.1:"+strconv.Itoa(port))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- run(ctx, nil, env, strings.NewReader(""), io.Discard, io.Discard) }()
+	waitForHealth(t, port)
+	cancel()
+	<-done
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("Grafana was called %d times before the first tool call", n)
+	}
+}
+
+func TestRun_BindFailureNotReady(t *testing.T) {
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	env := append(baseEnv("https://grafana.test"),
+		"MCP_TRANSPORT=http", "MCP_TOKEN="+testMCPToken, "MCP_LISTEN="+busy.Addr().String())
+
+	var stderr bytes.Buffer
+	code := run(context.Background(), nil, env, strings.NewReader(""), io.Discard, &stderr)
+	if code != exitRuntime {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if strings.Contains(stderr.String(), `"msg":"ready"`) || !strings.Contains(stderr.String(), "cannot listen") {
+		t.Fatalf("stderr = %s, want a bind error and no ready line", stderr.String())
 	}
 }

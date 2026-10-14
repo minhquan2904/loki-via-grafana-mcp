@@ -115,6 +115,22 @@ func TestHostCheck(t *testing.T) {
 		})
 	}
 
+	t.Run("same host listed twice", func(t *testing.T) {
+		multi := []struct {
+			patterns []string
+			host     string
+		}{
+			{[]string{"example.test:8000", "example.test:8443"}, "example.test:8443"},
+			{[]string{"localhost:*", "localhost"}, "localhost"},
+			{[]string{"localhost", "localhost:*"}, "localhost:8000"},
+		}
+		for _, tc := range multi {
+			if !hostAllowed(tc.patterns, tc.host) {
+				t.Errorf("hostAllowed(%v, %q) = false, want true", tc.patterns, tc.host)
+			}
+		}
+	})
+
 	t.Run("middleware stops the request", func(t *testing.T) {
 		next := &okHandler{}
 		rec := httptest.NewRecorder()
@@ -174,6 +190,31 @@ func TestBearerAuth_ConstantTime(t *testing.T) {
 
 	if rec.Code != http.StatusOK || next.count() != 1 {
 		t.Fatalf("valid token refused: status %d, handler calls %d", rec.Code, next.count())
+	}
+
+	for _, bad := range []string{testToken + "x", testToken[:len(testToken)-1], strings.ToUpper(testToken)} {
+		rec := httptest.NewRecorder()
+		BearerAuth(testToken, next).ServeHTTP(rec, bearerRequest(t, http.MethodPost, "/mcp", bad, nil))
+		assertRefusal(t, rec, http.StatusUnauthorized, "unauthorized")
+	}
+	if next.count() != 1 {
+		t.Fatalf("the handler ran for a wrong token")
+	}
+}
+
+func TestBearerAuth_EmptyConfiguredTokenRefusesAll(t *testing.T) {
+	next := &okHandler{}
+	for _, header := range []string{"Bearer ", "Bearer", "", "bearer  "} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		BearerAuth("", next).ServeHTTP(rec, req)
+		assertRefusal(t, rec, http.StatusUnauthorized, "unauthorized")
+	}
+	if next.count() != 0 {
+		t.Fatalf("an empty configured token let a request through")
 	}
 }
 
@@ -242,6 +283,55 @@ func TestBodyLimit(t *testing.T) {
 			t.Fatalf("status = %d, handler calls = %d", rec.Code, next.count())
 		}
 	})
+
+	t.Run("chunked too large", func(t *testing.T) {
+		next := &okHandler{}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/mcp", io.NopCloser(strings.NewReader(strings.Repeat("x", 17))))
+		req.ContentLength = -1
+
+		BodyLimit(16, next).ServeHTTP(rec, req)
+
+		assertRefusal(t, rec, http.StatusRequestEntityTooLarge, "request body too large")
+		if next.count() != 0 {
+			t.Fatalf("the handler ran on an oversized chunked body")
+		}
+	})
+
+	t.Run("chunked within the limit is replayed intact", func(t *testing.T) {
+		var got string
+		next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			got = string(b)
+		})
+		req := httptest.NewRequest(http.MethodPost, "/mcp", io.NopCloser(strings.NewReader(strings.Repeat("y", 16))))
+		req.ContentLength = -1
+
+		BodyLimit(16, next).ServeHTTP(httptest.NewRecorder(), req)
+
+		if got != strings.Repeat("y", 16) {
+			t.Fatalf("handler read %q", got)
+		}
+	})
+
+	t.Run("chunked over the wire through New", func(t *testing.T) {
+		srv := newTestServer(t, Options{})
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write(bytes.Repeat([]byte("z"), maxBodyBytes+1))
+			_ = pw.Close()
+		}()
+		req := bearerRequest(t, http.MethodPost, srv.URL+"/mcp", testToken, pr) // pipe -> chunked
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		if res.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(string(body), `"request body too large"`) {
+			t.Fatalf("status %d body %q, want our JSON 413", res.StatusCode, body)
+		}
+	})
 }
 
 // TestLimit_ServerBusy: the second concurrent request waits, then gets 503 with
@@ -308,6 +398,17 @@ func TestHealthz_NoAuth(t *testing.T) {
 		}
 		if mcp.count() != 0 {
 			t.Fatalf("the MCP handler ran without a token")
+		}
+	})
+
+	t.Run("healthz is GET only", func(t *testing.T) {
+		res, err := http.Post(srv.URL+"/healthz", "text/plain", nil)
+		if err != nil {
+			t.Fatalf("POST /healthz: %v", err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want 405", res.StatusCode)
 		}
 	})
 
@@ -422,4 +523,113 @@ func lastLogLine(t *testing.T, buf *bytes.Buffer) map[string]any {
 		t.Fatalf("log line %q is not JSON: %v", raw, err)
 	}
 	return entry
+}
+
+// TestNew_ChainOrder pins which check answers when several would fail, so a
+// reordering of the middleware chain breaks a test.
+func TestNew_ChainOrder(t *testing.T) {
+	srv := newTestServer(t, Options{AllowedOrigins: []string{"http://localhost:8000"}})
+	big := strings.Repeat("x", maxBodyBytes+1)
+
+	cases := []struct {
+		name   string
+		host   string
+		origin string
+		token  string
+		body   string
+		status int
+	}{
+		{"bad host beats bad token", "evil.example.test", "", "wrong-token-0000000", "{}", http.StatusMisdirectedRequest},
+		{"bad origin beats bad token", "", "https://evil.example.test", "wrong-token-0000000", "{}", http.StatusForbidden},
+		{"no token beats a large body", "", "", "", big, http.StatusUnauthorized},
+		{"large body with token", "", "", testToken, big, http.StatusRequestEntityTooLarge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := bearerRequest(t, http.MethodPost, srv.URL+"/mcp", tc.token, strings.NewReader(tc.body))
+			if tc.host != "" {
+				req.Host = tc.host
+			}
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			res.Body.Close()
+			if res.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", res.StatusCode, tc.status)
+			}
+		})
+	}
+}
+
+// TestNew_MaxConcurrent checks that Options.MaxConcurrent reaches the limiter.
+func TestNew_MaxConcurrent(t *testing.T) {
+	old := limitWait
+	limitWait = 20 * time.Millisecond
+	t.Cleanup(func() { limitWait = old })
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	blocking := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+	})
+	srv := newTestServer(t, Options{MCP: blocking, MaxConcurrent: 1})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		res, err := http.DefaultClient.Do(bearerRequest(t, http.MethodPost, srv.URL+"/mcp", testToken, strings.NewReader("{}")))
+		if err == nil {
+			res.Body.Close()
+		}
+	}()
+	<-entered
+
+	res, err := http.DefaultClient.Do(bearerRequest(t, http.MethodPost, srv.URL+"/mcp", testToken, strings.NewReader("{}")))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", res.StatusCode)
+	}
+	close(release)
+	<-done
+}
+
+func TestAccessLog_CustomUserHeader(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	log := slog.New(slog.NewJSONHandler(&lockedBuffer{b: &buf, mu: &mu}, nil))
+	srv := newTestServer(t, Options{Log: log, UserHeader: "X-Remote-User"})
+
+	req := bearerRequest(t, http.MethodPost, srv.URL+"/mcp", testToken, strings.NewReader("{}"))
+	req.Header.Set("X-Remote-User", "alice")
+	req.Header.Set("X-Mcp-Gateway-User", "mallory")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(buf.String(), `"user":"alice"`) || strings.Contains(buf.String(), "mallory") {
+		t.Fatalf("access log = %s, want the user from X-Remote-User only", buf.String())
+	}
+}
+
+type lockedBuffer struct {
+	b  *bytes.Buffer
+	mu *sync.Mutex
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
 }
