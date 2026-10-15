@@ -411,3 +411,59 @@ func TestRun_BindFailureNotReady(t *testing.T) {
 		t.Fatalf("stderr = %s, want a bind error and no ready line", stderr.String())
 	}
 }
+
+// proxyTransport makes requests look like they came through a reverse proxy:
+// another Host header and a browser Origin for that host.
+type proxyTransport struct {
+	host, origin string
+}
+
+func (t proxyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	clone := r.Clone(r.Context())
+	clone.Host = t.host
+	clone.Header.Set("Origin", t.origin)
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// TestRun_BehindProxyHost proves the SDK adds no host or origin check of its own
+// on top of HostCheck/OriginCheck: a server bound to loopback must still serve a
+// proxy that forwards an allowed, non-localhost Host and Origin.
+func TestRun_BehindProxyHost(t *testing.T) {
+	grafanaSrv := fakeGrafana(t)
+	port := freePort(t)
+
+	env := append(baseEnv(grafanaSrv.URL),
+		"MCP_TRANSPORT=http",
+		"MCP_TOKEN="+testMCPToken,
+		"MCP_LISTEN=127.0.0.1:"+strconv.Itoa(port),
+		"MCP_ALLOWED_HOSTS=127.0.0.1:*,mcp.test",
+		"LOG_LEVEL=warn",
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, nil, env, strings.NewReader(""), io.Discard, io.Discard)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	waitForHealth(t, port)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "e2e", Version: "0"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint: fmt.Sprintf("http://127.0.0.1:%d/mcp", port),
+		HTTPClient: &http.Client{Transport: bearerTransport{
+			token: testMCPToken,
+			base:  proxyTransport{host: "mcp.test", origin: "https://mcp.test"},
+		}},
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect through the proxied host: %v", err)
+	}
+	defer session.Close()
+	if _, err := session.ListTools(ctx, nil); err != nil {
+		t.Fatalf("ListTools through the proxied host: %v", err)
+	}
+}

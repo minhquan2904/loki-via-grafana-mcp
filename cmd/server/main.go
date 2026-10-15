@@ -111,7 +111,11 @@ func run(ctx context.Context, args []string, environ []string, stdin io.Reader, 
 
 	handler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return srv },
-		&mcp.StreamableHTTPOptions{JSONResponse: true, Stateless: true},
+		// HostCheck already guards against DNS rebinding with MCP_ALLOWED_HOSTS.
+		// The SDK's own guard ignores that list and refuses any non-localhost
+		// Host arriving on loopback, which breaks a reverse proxy on the same
+		// machine.
+		&mcp.StreamableHTTPOptions{JSONResponse: true, Stateless: true, DisableLocalhostProtection: true},
 	)
 	httpSrv := httpserver.New(httpserver.Options{
 		Addr:           cfg.ListenAddr,
