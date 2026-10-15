@@ -54,9 +54,14 @@ writes to Grafana.
 | `MCP_ALLOWED_HOSTS` | no | `127.0.0.1:*,localhost:*,[::1]:*` | CSV of `host`, `host:port` or `host:*` patterns |
 | `MCP_USER_HEADER` | no | `X-MCP-Gateway-User` | Header carrying the caller identity for the access log |
 | `LOG_LEVEL` | no | `info` | `debug`, `info`, `warn`, `error` |
-| `GRAFANA_TIMEOUT` | no | `60s` | Per Grafana call, between 1ms and 5m |
+| `GRAFANA_TIMEOUT` | no | `60s` | Per Grafana call, between 1ms and 5m; over HTTP keep it under 2m, see below |
 | `GRAFANA_ALLOW_INSECURE` | no | `false` | Required for a plain `http` Grafana that is not on loopback |
 | `MCP_MAX_CONCURRENT` | no | `16` | Concurrent `/mcp` requests; a request that waits more than 30s gets 503 |
+
+Over HTTP the server closes a response after 120s (`WriteTimeout`), so a
+`GRAFANA_TIMEOUT` above about 110s only turns a Grafana error into a dropped
+connection. A request that waits for a `MCP_MAX_CONCURRENT` slot spends that
+wait inside the 30s read timeout as well.
 
 Secrets are read from the file form first. A missing or unreadable file, or a
 file that holds anything other than a single line, is a startup error that names
