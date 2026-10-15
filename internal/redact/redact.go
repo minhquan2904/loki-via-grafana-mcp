@@ -14,12 +14,14 @@ import (
 )
 
 // defaultPatterns are the built-in generic shapes that must never reach a public
-// repository: private address ranges, Grafana token prefixes and a bearer
-// credential that got pasted into a file.
+// repository: private and carrier-grade NAT (100.64.0.0/10, used by overlay VPNs)
+// address ranges, Grafana token prefixes and a bearer credential that got pasted
+// into a file.
 var defaultPatterns = []string{
 	`\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b`,
 	`\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b`,
 	`\b192\.168\.\d{1,3}\.\d{1,3}\b`,
+	`\b100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b`,
 	`(fc|fd)[0-9a-f]{2}:`,
 	`glsa_[A-Za-z0-9]{8,}`,
 	`glc_[A-Za-z0-9]{8,}`,

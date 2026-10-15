@@ -24,6 +24,8 @@ func TestDenylist_Default(t *testing.T) {
 		{"private 10/8", "host " + "10" + "." + "1" + "." + "2" + "." + "3" + " seen"},
 		{"private 172.16/12", "host " + "172" + ".16." + "5.5" + " seen"},
 		{"private 192.168/16", "host " + "192" + ".168." + "1.10" + " seen"},
+		{"cgnat 100.64/10 low", "host " + "100" + ".64." + "0.1" + " seen"},
+		{"cgnat 100.64/10 high", "host " + "100" + ".127." + "9.9" + " seen"},
 		{"unique local ipv6", "host " + "fc" + "00::1" + " seen"},
 		{"sa token", "glsa" + "_" + strings.Repeat("a", 12)},
 		{"cloud token", "glc" + "_" + strings.Repeat("b", 12)},
@@ -45,6 +47,8 @@ func TestDenylist_Default(t *testing.T) {
 		`{app="demo"} |= "error"`,
 		"level=error msg=\"boom\"",
 		"192.168.1",     // not a full address
+		"100.63.1.1",    // just below 100.64/10
+		"100.128.1.1",   // just above 100.64/10
 		"glsa_short",    // below the token length floor
 		"Authorization", // no credential attached
 	}
