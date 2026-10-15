@@ -190,6 +190,11 @@ func TestLoad_Transport(t *testing.T) {
 		wantErr(t, err, "MCP_TOKEN must be at least 16 characters")
 	})
 
+	t.Run("http with short token file", func(t *testing.T) {
+		_, err := Load(baseEnv("MCP_TRANSPORT=http", "MCP_TOKEN_FILE="+writeSecret(t, "short\n")))
+		wantErr(t, err, "MCP_TOKEN must be at least 16 characters")
+	})
+
 	t.Run("http with token", func(t *testing.T) {
 		cfg, err := Load(baseEnv("MCP_TRANSPORT=http", "MCP_TOKEN=0123456789abcdef"))
 		if err != nil {
@@ -360,6 +365,20 @@ func TestLoad_AllowInsecure(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("Load(%s): %v", host, err)
 			}
+		}
+	})
+
+	t.Run("loopback lookalikes need the flag", func(t *testing.T) {
+		for _, host := range []string{
+			"http://127.0.0.1.evil.test",
+			"http://localhost.evil.test",
+			"http://" + "10" + ".0.0.1",
+		} {
+			_, err := Load([]string{
+				"GRAFANA_URL=" + host,
+				"GRAFANA_SERVICE_ACCOUNT_TOKEN=" + secret,
+			})
+			wantErr(t, err, "GRAFANA_URL uses http; set GRAFANA_ALLOW_INSECURE=true to send the token unencrypted")
 		}
 	})
 

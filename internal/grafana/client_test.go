@@ -299,3 +299,26 @@ func TestListDatasources_SortIsDeterministic(t *testing.T) {
 		t.Fatalf("order = %v, want name then uid", uids)
 	}
 }
+
+// TestClient_Timeout gives up after GRAFANA_TIMEOUT instead of waiting for a
+// stalled Grafana.
+func TestClient_Timeout(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(release); server.Close() })
+	client := NewClient(server.URL, testToken, 100*time.Millisecond, nil)
+
+	start := time.Now()
+	_, err := client.ListDatasources(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "Grafana request failed: ") {
+		t.Fatalf("err = %v, want a transport error", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("the call took %s; the 100ms timeout was not applied", elapsed)
+	}
+}

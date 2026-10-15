@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // frameStart is the first timestamp of every fixture: 2025-10-07T01:20:00Z.
@@ -294,5 +295,59 @@ func TestParseFrames_NaNStringBecomesNull(t *testing.T) {
 	}
 	if _, err := json.Marshal(result); err != nil {
 		t.Fatalf("result does not encode: %v", err)
+	}
+}
+
+// TestParseFrames_MultibyteTruncation cuts on rune boundaries: exactly
+// MaxLineChars runes stay whole, one more is cut to valid UTF-8.
+func TestParseFrames_MultibyteTruncation(t *testing.T) {
+	for _, tc := range []struct {
+		runes     int
+		truncated bool
+	}{
+		{MaxLineChars, false},
+		{MaxLineChars + 1, true},
+	} {
+		line := strings.Repeat("é", tc.runes)
+		frame := fmt.Sprintf(`{"schema":{"fields":[{"name":"Time","type":"time"},{"name":"Line","type":"string"}]},`+
+			`"data":{"values":[[%d],["%s"]]}}`, frameStart, line)
+		result, err := ParseFrames([]json.RawMessage{json.RawMessage(frame)})
+		if err != nil {
+			t.Fatalf("ParseFrames: %v", err)
+		}
+		entry := result.Logs[0]
+		if entry.Truncated != tc.truncated {
+			t.Fatalf("%d runes: truncated = %v, want %v", tc.runes, entry.Truncated, tc.truncated)
+		}
+		if got := len([]rune(entry.Line)); got != MaxLineChars {
+			t.Fatalf("%d runes: kept %d, want %d", tc.runes, got, MaxLineChars)
+		}
+		if !utf8.ValidString(entry.Line) {
+			t.Fatalf("%d runes: the kept line is not valid UTF-8", tc.runes)
+		}
+	}
+}
+
+// TestParseFrames_MixedLogAndMetric keeps the logs and drops the series, as the
+// reference implementation does.
+func TestParseFrames_MixedLogAndMetric(t *testing.T) {
+	logFrame := fmt.Sprintf(`{"schema":{"fields":[{"name":"Time","type":"time"},{"name":"Line","type":"string"}]},`+
+		`"data":{"values":[[%d],["boom"]]}}`, frameStart)
+	metricFrame := fmt.Sprintf(`{"schema":{"fields":[{"name":"Time","type":"time"},{"name":"Value","type":"number"}]},`+
+		`"data":{"values":[[%d],[3]]}}`, frameStart)
+
+	result, err := ParseFrames([]json.RawMessage{json.RawMessage(metricFrame), json.RawMessage(logFrame)})
+	if err != nil {
+		t.Fatalf("ParseFrames: %v", err)
+	}
+	if result.Type != "logs" || len(result.Logs) != 1 {
+		t.Fatalf("type = %q, logs = %v; want one log line", result.Type, result.Logs)
+	}
+	body, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), `"series"`) {
+		t.Fatalf("a log result must not carry series: %s", body)
 	}
 }
